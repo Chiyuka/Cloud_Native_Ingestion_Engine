@@ -23,6 +23,7 @@ from pyspark.sql.types import (
     StructType, StructField,
     StringType, DoubleType, LongType, IntegerType
 )
+from data_quality import run_quality_checks
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -254,6 +255,7 @@ def write_to_postgres(df):
 def run():
     log.info("=== WeatherFlow ETL pipeline starting ===")
     df = read_raw(RAW_DATA_PATH)
+    df, bad_df = run_quality_checks(df, JDBC_URL, JDBC_PROPS) 
     df = clean_nulls(df)
     df = standardise_timestamps(df)
     df = rolling_avg_temperature(df)
