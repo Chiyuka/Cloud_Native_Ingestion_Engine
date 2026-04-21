@@ -23,7 +23,12 @@ from pyspark.sql.types import (
     StructType, StructField,
     StringType, DoubleType, LongType, IntegerType
 )
-from data_quality import run_quality_checks
+from data_quality import (
+    enforce_schema,
+    run_quality_checks,
+    SchemaEnforcementError,
+    DataQualityError
+)
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -54,8 +59,9 @@ spark = (
     SparkSession.builder
     .appName("WeatherFlow-ETL")
     .master("local[*]")
-    .config("spark.sql.session.timeZone", "UTC")          # all timestamps in UTC
-    .config("spark.sql.shuffle.partitions", "4")          # right-sized for a small job
+    .config("spark.sql.session.timeZone", "UTC")
+    .config("spark.sql.shuffle.partitions", "4")
+    .config("spark.jars", "/opt/postgresql-42.7.1.jar")   # ← add this line
     .getOrCreate()
 )
 spark.sparkContext.setLogLevel("WARN")
@@ -218,22 +224,41 @@ def add_derived_columns(df):
 
 def write_to_postgres(df):
     log.info("Writing weather_raw to PostgreSQL...")
-    (
-        df
-        .select(
-            "city", "recorded_at", "recorded_hour", "recorded_date",
-            "temp", "feels_like", "feels_like_delta", "humidity",
-            "pressure", "wind_speed", "weather_main", "weather_desc",
-            "temp_rolling_avg_5m", "comfort_label"
+
+    # Read already-stored (city, recorded_at) pairs from Postgres
+    # Then filter them out before writing — idempotent by design
+    try:
+        existing = spark.read.jdbc(
+            url=JDBC_URL,
+            table="(SELECT city, recorded_at FROM weather_raw) AS existing",
+            properties=JDBC_PROPS
         )
-        .write
-        .jdbc(url=JDBC_URL, table="weather_raw", mode="append", properties=JDBC_PROPS)
-    )
-    log.info("weather_raw written.")
+        df_new = df.join(existing, on=["city", "recorded_at"], how="left_anti")
+        log.info(f"Skipping {df.count() - df_new.count()} already-loaded rows")
+    except Exception:
+        # First run — table is empty, write everything
+        df_new = df
+
+    row_count = df_new.count()
+    if row_count == 0:
+        log.info("No new rows to write — all records already exist in DB")
+    else:
+        (
+            df_new.select(
+                "city", "recorded_at", "recorded_hour", "recorded_date",
+                "temp", "feels_like", "feels_like_delta", "humidity",
+                "pressure", "wind_speed", "weather_main", "weather_desc",
+                "temp_rolling_avg_5m", "comfort_label"
+            )
+            .write
+            .jdbc(url=JDBC_URL, table="weather_raw", mode="append", properties=JDBC_PROPS)
+        )
+        log.info(f"weather_raw: wrote {row_count} new rows")
 
     log.info("Writing weather_hourly_agg to PostgreSQL...")
     hourly = (
-        df.groupBy("city", "recorded_hour")
+        df.withColumnRenamed("recorded_hour", "hour")
+        .groupBy("city", "hour")            # ← matches the DB column name
         .agg(
             F.round(F.avg("temp"),       2).alias("avg_temp"),
             F.round(F.max("temp"),       2).alias("max_temp"),
@@ -254,14 +279,23 @@ def write_to_postgres(df):
 # ── 8.  Pipeline Orchestration ────────────────────────────────────────────────
 def run():
     log.info("=== WeatherFlow ETL pipeline starting ===")
+
     df = read_raw(RAW_DATA_PATH)
-    df, bad_df = run_quality_checks(df, JDBC_URL, JDBC_PROPS) 
+
+    # Gate 1 — schema enforcement
+    df, violations = enforce_schema(df)
+
+    # Gate 2 — data quality checks
+    df, report = run_quality_checks(df)
+    log.info(report.summary())
+
+    # Transformations
     df = clean_nulls(df)
     df = standardise_timestamps(df)
     df = rolling_avg_temperature(df)
     df = add_derived_columns(df)
 
-    # Cache before the double write — avoids re-computing all transformations twice
+    # Cache before double write
     df.cache()
     log.info(f"Final record count before write: {df.count()}")
 
